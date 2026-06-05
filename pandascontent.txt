@@ -1,0 +1,508 @@
+Most slow Pandas code "works", until it doesn't. Learn how to spot hidden bottlenecks, avoid costly row-wise operations, and know when Pandas is no longer enough.
+
+gI’ve been learning Pandas for some time now. Nothing too crazy though. Just basic data cleaning, exploratory data analysis, and some essential functions. I’ve also explored things like method chaining for cleaner, more organized code, and operations that silently break your Pandas workflow, both of which I’ve written about before.
+
+I never really thought about runtime. Honestly, if my code ran without errors and gave me the output I needed, I was happy. Even if it took a few minutes for all my notebook cells to finish, I didn’t care. No errors meant no problems, right?
+
+Then I came across the concept of vectorization. And something clicked.
+
+I went down the rabbit hole, as I usually do. The more I read, the more I realized that “no errors” and “efficient code” are two very different things. Your Pandas code can be completely correct and still be quietly terrible at scale.
+
+So this article is me documenting what I found. The mistakes that slow Pandas code down, why they happen, how to fix them, and when Pandas itself might be the bottleneck. If you’ve ever run a notebook and just assumed the wait time was normal, this one’s for you.
+Why “Working Code” Isn’t Good Enough
+
+There’s a reason this took me a while to think about. Pandas is designed to be forgiving. You can write code in a dozen different ways and most of them will work. You get your output, your dataframe looks right, and you move on.
+
+But that flexibility comes with a hidden cost.
+
+Unlike SQL or production-grade data systems, Pandas doesn’t force you to think about efficiency. It doesn’t warn you when you’re doing something expensive. It just… does it. Slowly, sometimes. But it does it.
+
+Think about it this way. SQL has a query optimizer. It looks at what you’re asking for and figures out the most efficient way to get it. Pandas doesn’t have that. It trusts you to write efficient code. And if you don’t know what efficient looks like, you’ll never know you’re missing it.
+
+The result is that a lot of Pandas code in the wild is what I’d call politely inefficient. It works on small datasets. It works on medium datasets with a little patience. But the moment you throw real-world data at it, something that’s a few hundred thousand rows or more, the cracks start to show. What used to take seconds now takes minutes. What took minutes becomes unusable.
+
+And the frustrating part is nothing looks wrong. No errors. No warnings. Just a slow notebook and a spinning cursor.
+
+That’s the trap. Pandas optimizes for convenience, not speed. And convenience is great, until it isn’t.
+
+So the first shift is a mindset one: working code and efficient code are not the same thing. Once that clicks, everything else follows.
+Profiling: Stop Guessing, Start Measuring
+
+Here’s something I noticed while going down this rabbit hole. Most people, when they feel like their code is slow, do one of two things. They either rewrite the whole thing from scratch hoping something improves, or they just accept it and wait.
+
+Neither of those is the right move.
+
+The right move is to measure first. You can’t optimize what you haven’t identified. And more often than not, the part of your code you think is slow isn’t actually the problem.
+
+Pandas gives you a few simple tools to start with.
+%timeit — Know How Long Things Actually Take
+
+%timeit is a Jupyter magic command that runs a line of code multiple times and gives you the average execution time. It’s the simplest way to compare two approaches and know, concretely, which one is faster.
+
+import pandas as pd
+import numpy as np
+
+df = pd.DataFrame({
+    'sales': np.random.randint(100, 10000, size=100_000),
+    'discount': np.random.uniform(0.0, 0.5, size=100_000)
+})
+
+# Approach A
+%timeit df.apply(lambda row: row['sales'] * row['discount'], axis=1)
+
+# Approach B
+%timeit df['sales'] * df['discount']
+
+On a dataset of 100,000 rows, the difference is not subtle:
+
+1.91 s ± 228 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+316 μs ± 14 μs per loop (mean ± std. dev. of 7 runs, 1,000 loops each)
+
+Same output. Completely different cost. That’s the kind of thing you’d never notice by just running the cell once and moving on.
+df.info() and df.memory_usage() — Know What You’re Carrying
+
+Speed isn’t just about computation. Memory plays a huge role too. A dataframe that’s bloated with the wrong data types will slow everything down before you’ve even written a single transformation.
+
+df.info()
+
+Output:
+
+<class 'pandas.core.frame.DataFrame'>
+RangeIndex: 100000 entries, 0 to 99999
+Data columns (total 2 columns):
+ #   Column    Non-Null Count   Dtype  
+---  ------    --------------   -----  
+ 0   sales     100000 non-null  int64  
+ 1   discount  100000 non-null  float64
+dtypes: float64(1), int64(1)
+memory usage: 1.5 MB
+
+To check the memory usage
+
+df.memory_usage(deep=True)
+
+Output:
+
+Index          132
+sales       400000
+discount    800000
+dtype: int64
+
+Here, we can see that discount is taking up twice the space. This is because discount is stored as a “heavier” number type (float64) while sales is stored in a “lighter” type (int32).
+
+This becomes especially important when you’re working with string columns or object types that are secretly eating memory. We’ll come back to this in the next section.
+The Profiling Mindset
+
+The tools themselves are simple. The shift is in how you approach your code. Before you optimize anything, ask: where is the time actually going? Measure the slow parts. Compare alternatives. Let the numbers tell you what to fix.
+
+Because what feels slow and what is slow are often two different things entirely.
+Mistake #1: Row-wise Operations (The Silent Killer)
+
+If there’s one thing I kept seeing come up again and again while researching this topic, it was this: people looping through Pandas dataframes row by row. And I get it. It feels natural. You think about your data one row at a time, so you write code that processes it one row at a time.
+
+The problem is, that’s not how Pandas thinks.
+How Pandas Actually Works
+
+Pandas is built on top of NumPy, which stores data in contiguous blocks of memory, column by column. This means Pandas is heavily optimized to operate on entire columns at once. When you do that, it runs fast, low-level, vectorized operations under the hood.
+
+When you loop through rows instead, you’re essentially bypassing all of that. You’re dropping down into pure Python, one row at a time, with all the overhead that comes with it. On a small dataset you’ll never notice. On a large one, you’ll be waiting a long time.
+
+There are two patterns that show up constantly.
+.iterrows()
+
+# Calculating a discounted price row by row
+discounted_prices = []
+
+for index, row in df.iterrows():
+    discounted_prices.append(row['sales'] * (1 - row['discount']))
+
+df['discounted_price'] = discounted_prices
+
+
+This works. It will give you the right answer. But on a dataframe with 100,000 rows, it is painfully slow.
+
+%timeit [row['sales'] * (1 - row['discount']) for index, row in df.iterrows()]
+
+Output:
+
+10.2 s ± 1.73 s per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+.apply(axis=1)
+
+This one is sneakier because it looks more “Pandas-like.” But applying a function across axis=1 means applying it row by row, which is essentially the same problem.
+
+%timeit df.apply(lambda row: row['sales'] * (1 - row['discount']), axis=1)
+
+Output:
+
+1.5 s ± 88.1 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+Faster than .iterrows(), but still operating row by row. Still slow.
+The Fix: Vectorized Operations
+
+Here’s the same calculation, done the way Pandas actually wants you to do it:
+
+df['discounted_price'] = df['sales'] * (1 - df['discount'])
+
+Let’s time it
+
+%timeit df['sales'] * (1 - df['discount'])
+
+Output:
+
+688 μs ± 236 μs per loop (mean ± std. dev. of 7 runs, 1,000 loops each)
+
+That’s it. One line. No loop. No lambda. And it’s roughly 14,800x faster than .iterrows() and 2,180x faster than .apply(axis=1).
+
+What’s happening here is that Pandas passes the entire column to NumPy, which executes the operation at the C level across the whole array at once. No Python overhead. No row-by-row iteration. Just fast, low-level computation.
+When .apply() Is Actually Fine
+
+To be fair, .apply() isn’t always the villain. When you’re applying a function column-wise (axis=0, which is the default), it’s often perfectly reasonable. The issue is specifically axis=1, which forces row-by-row execution.
+
+And sometimes your logic is genuinely complex enough that a clean vectorized expression isn’t obvious. In those cases, np.vectorize() or np.where() can give you something closer to vectorized performance while still letting you express conditional logic clearly.
+
+# Instead of this
+df['category'] = df.apply(
+    lambda row: 'high' if row['sales'] > 5000 else 'low', axis=1
+)
+
+# Do this
+df['category'] = np.where(df['sales'] > 5000, 'high', 'low')
+
+%timeit df.apply(lambda row: 'high' if row['sales'] > 5000 else 'low', axis=1)
+%timeit np.where(df['sales'] > 5000, 'high', 'low')
+
+Output:
+
+1.31 s ± 189 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+1.3 ms ± 180 μs per loop (mean ± std. dev. of 7 runs, 1,000 loops each)
+
+Same result. About 1,000x faster.
+The Rule of Thumb
+
+If you’re writing a loop over rows in Pandas, stop and ask yourself: can this be expressed as a column operation? Nine times out of ten, the answer is yes. And when it is, the performance difference is transformative.
+
+If you’re looping through rows, you’re not using Pandas. You’re using Python with extra steps.
+Mistake #2: Unnecessary Copies and Memory Bloat
+
+Row-wise operations get a lot of attention when people talk about Pandas performance. Memory gets a lot less. Which is a shame, because in my experience reading about this, bloated memory is just as responsible for slow notebooks as bad computation.
+
+Here’s the thing. Pandas operations don’t always modify your dataframe in place. A lot of them quietly create a brand new copy of your data behind the scenes. Do that enough times, and you’re not just holding one dataframe in memory. You’re holding several, all at once, without realizing it.
+The Hidden Cost of Chained Operations
+
+Chained operations are a common culprit. They look clean and readable, but each step can generate an intermediate copy that sits in memory until garbage collection cleans it up.
+
+# Each step here potentially creates a new copy
+df2 = df[df['sales'] > 1000]
+df3 = df2.dropna()
+df4 = df3.reset_index(drop=True)
+df5 = df4[['sales', 'discount']]
+
+By the time you get to df5, you potentially have five versions of your data floating around in memory simultaneously. On a small dataset this is invisible. On a large one, this is how you run out of RAM.
+Temporary Columns That Stick Around
+
+Another pattern that quietly eats memory is creating columns you only needed temporarily.
+
+df['gross_revenue'] = df['sales'] * df['quantity']
+df['tax'] = df['gross_revenue'] * 0.075
+df['net_revenue'] = df['gross_revenue'] - df['tax']
+
+# But you only actually needed net_revenue
+
+gross_revenue and tax are now permanent columns in your dataframe, taking up memory for the rest of your notebook even though they were just stepping stones.
+
+The fix is simple. Either compute directly:
+
+df['net_revenue'] = (df['sales'] * df['quantity']) * (1 - 0.075)
+
+Or drop them as soon as you’re done:
+
+df.drop(columns=['gross_revenue', 'tax'], inplace=True)
+
+Wrong Data Types Are Quietly Expensive
+
+This one surprised me when I came across it. By default, Pandas is quite generous with how much memory it assigns to each column. Integer columns get int64. Float columns get float64. String columns become object type, which is one of the most memory-hungry types in Pandas.
+
+Let’s see what that actually looks like:
+
+df = pd.DataFrame({
+    'order_id': np.random.randint(1000, 9999, size=100_000),
+    'sales': np.random.randint(100, 10000, size=100_000),
+    'discount': np.random.uniform(0.0, 0.5, size=100_000),
+    'region': np.random.choice(['north', 'south', 'east', 'west'], size=100_000)
+})
+
+df.memory_usage(deep=True)
+
+Output
+
+Index           132
+order_id     400000
+sales        400000
+discount     800000
+region      5350066
+dtype: int64
+
+That region column, which only has four possible values, is consuming 5.3MB as an object type. Convert it to a categorical and watch what happens:
+
+df['region'] = df['region'].astype('category')
+df.memory_usage(deep=True)
+
+Output:
+
+Index          132
+order_id    400000
+sales       400000
+discount    800000
+region      100386
+dtype: int64
+
+From 5.3MB down to about 100KB. For one column. The same logic applies to integer columns where you don’t need the full int64 range. If your values fit comfortably in int32 or even int16, downcasting saves real memory.
+
+df['sales'] = df['sales'].astype('int32')
+df['order_id'] = df['order_id'].astype('int32')
+
+df.memory_usage(deep=True)
+
+Output:
+
+Index       128
+order_id    400000
+sales       400000
+discount    800000
+region      100563
+dtype: int64
+
+A few small type changes and your dataframe is already significantly lighter. And a lighter dataframe means faster operations across the board, because there’s simply less data to move around.
+The Quick Memory Check Habit
+
+Before you run any heavy transformation, it’s worth knowing what you’re working with:
+
+print(f"Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+
+It takes one second and it tells you exactly how much memory your dataframe is consuming at that point. Make it a habit before and after major transformations and you’ll quickly develop an intuition for when something is heavier than it should be.
+The Insight
+
+Slow code isn’t always about computation. Sometimes your notebook is slow because it’s carrying far more data than it needs to, in formats that are far more expensive than necessary. Trimming memory isn’t glamorous work, but it compounds. A dataframe that’s lighter to store is faster to filter, faster to merge, faster to transform.
+
+Memory and speed are not separate problems. They’re the same problem.
+Mistake #3: Overusing Pandas for Everything
+
+This one is a little different from the previous two. It’s not about a specific function or a bad habit. It’s about knowing the limits of your tool.
+
+Pandas is genuinely great. For most data tasks, especially at the scale most people are working at, it’s more than enough. But there’s a version of Pandas usage that I kept seeing described while researching this: people reaching for Pandas by default, for everything, regardless of whether it’s the right fit.
+
+And at a certain scale, that becomes a problem.
+The Dataset
+
+To make this real, I generated a synthetic e-commerce dataset with 1 million rows. Nothing exotic, just the kind of data you’d realistically encounter: orders, dates, regions, categories, sales figures, discounts, quantities and statuses.
+
+import pandas as pd
+import numpy as np
+
+np.random.seed(42)
+
+n = 1_000_000
+
+regions = ['north', 'south', 'east', 'west']
+categories = ['electronics', 'clothing', 'furniture', 'food', 'sports']
+statuses = ['completed', 'returned', 'pending', 'cancelled']
+
+df = pd.DataFrame({
+    'order_id': np.arange(1000, 1000 + n),
+    'order_date': pd.date_range(start='2022-01-01', periods=n, freq='1min'),
+    'region': np.random.choice(regions, size=n),
+    'category': np.random.choice(categories, size=n),
+    'sales': np.random.randint(100, 10000, size=n),
+    'quantity': np.random.randint(1, 20, size=n),
+    'discount': np.round(np.random.uniform(0.0, 0.5, size=n), 2),
+    'status': np.random.choice(statuses, size=n),
+})
+
+df.to_csv('large_sales_data.csv', index=False)
+
+One million rows. Saved to a CSV. This is the dataset we’ll be working with for the rest of the article.
+Where Pandas Starts to Struggle
+
+Pandas loads your entire dataset into memory. That’s fine when your data is a few hundred thousand rows. It starts to get uncomfortable at a few million. And beyond that, you’re fighting the tool.
+
+The other scenario is complex, nested transformations where you’re stacking multiple operations, creating intermediate results, and generally asking Pandas to do a lot of heavy lifting in sequence. Each step adds overhead. The costs stack up.
+
+Here’s a realistic example using our dataset. Say you need to calculate a rolling average of sales per region, flag orders above a threshold, then aggregate by month:
+
+# Step 1: Sort
+df = df.sort_values(['region', 'order_date'])
+
+# Step 2: Rolling average per region
+df['rolling_avg'] = (
+    df.groupby('region')['sales']
+    .transform(lambda x: x.rolling(window=7).mean())
+)
+
+# Step 3: Flag high-value orders
+df['high_value'] = df['sales'] > df['rolling_avg'] * 1.5
+
+# Step 4: Monthly aggregation
+df['month'] = pd.to_datetime(df['order_date']).dt.to_period('M')
+monthly_summary = df.groupby(['region', 'month'])['sales'].sum()
+
+This works. But notice that Step 2 uses .transform(lambda x: ...), which carries the same row-adjacent cost we talked about earlier. On 1 million rows, this pipeline will drag. Go ahead and time it on your machine and you’ll see exactly what I mean.
+What to Reach For Instead
+
+The good news is you don’t have to abandon Pandas entirely. There are a few options depending on the situation.
+
+Chunking
+If your dataset is too large to load all at once, Pandas lets you process it in chunks. Instead of loading all 1 million rows into memory at once, you load and process a portion at a time:
+
+chunk_size = 100_000
+results = []
+
+for chunk in pd.read_csv('large_sales_data.csv', chunksize=chunk_size):
+    chunk['discounted_price'] = chunk['sales'] * (1 - chunk['discount'])
+    results.append(chunk.groupby('region')['discounted_price'].sum())
+
+final_result = pd.concat(results).groupby(level=0).sum()
+print(final_result)
+
+Instead of asking Pandas to hold 1 million rows in memory simultaneously, you’re feeding it 100,000 rows at a time, processing each chunk, and assembling the results at the end. It’s not the most elegant pattern, but it lets you work with data that would otherwise crash your kernel.
+
+When to Consider Other Tools
+Sometimes the honest answer is that Pandas isn’t the right tool for the job. This isn’t a criticism, it’s just scope. A few worth knowing about:
+
+    Polars: A modern dataframe library built in Rust, designed for speed. It uses lazy evaluation, meaning it optimizes your entire query before executing it. For large datasets it can be dramatically faster than Pandas.
+    Dask: Extends Pandas to work in parallel across multiple cores or even multiple machines. If you’re comfortable with Pandas syntax, Dask feels familiar.
+    DuckDB: Lets you run SQL queries directly on your dataframes or CSV files with surprisingly fast performance. Great for aggregations and analytical queries on large data.
+
+The point isn’t to abandon Pandas. For most everyday data work, it’s the right choice. The point is to recognize when you’ve hit its ceiling, and know that there are good options on the other side of it.
+The Real-World Refactor: From 61 Seconds to 0.33 Seconds
+
+This is where everything we’ve covered stops being theoretical.
+I took our 1 million row e-commerce dataset and wrote the kind of Pandas code that feels completely normal. The kind of thing you’d write on a Tuesday afternoon without thinking twice.
+
+Then I timed it.
+The Slow Version
+
+import time
+
+df = pd.read_csv('large_sales_data.csv')
+
+start = time.time()
+
+# Row-wise revenue calculation
+df['gross_revenue'] = df.apply(
+    lambda row: row['sales'] * row['quantity'], axis=1
+)
+df['tax'] = df.apply(
+    lambda row: row['gross_revenue'] * 0.075, axis=1
+)
+df['net_revenue'] = df.apply(
+    lambda row: row['gross_revenue'] - row['tax'], axis=1
+)
+
+# Row-wise flagging
+df['order_flag'] = df.apply(
+    lambda row: 'high' if row['net_revenue'] > 50000 else 'low', axis=1
+)
+
+# Final aggregation
+result = df.groupby('region')['net_revenue'].sum()
+
+end = time.time()
+print(f"Total runtime: {end - start:.2f} seconds")
+
+Output:
+
+Total runtime: 61.78 seconds
+
+Over a minute. For a four-step pipeline. And nothing looks wrong. Let’s break down exactly what’s making it slow.
+
+Three mistakes, all in one pipeline:
+
+    First, the data types are never addressed. The region, category and status columns load as generic object types, which are memory-hungry and slow to work with. We’re carrying that dead weight through every single operation.
+    Second, there are three separate .apply(axis=1) calls just to calculate revenue. Each one loops through all 1 million rows in Python, one at a time. We already saw in Section 4 how expensive that is. Here we’re doing it three times in a row.
+    Third, gross_revenue and tax are created as permanent columns even though they’re just intermediate steps. They serve no purpose beyond being stepping stones to net_revenue, but they sit in memory for the rest of the pipeline anyway.
+
+Here’s how I’d fix this step by step
+
+Step 1: Fix data types upfront
+Before anything else, convert the obvious categorical columns:
+
+df['region'] = df['region'].astype('category')
+df['category'] = df['category'].astype('category')
+df['status'] = df['status'].astype('category')
+
+This alone reduces memory usage significantly and makes subsequent operations cheaper across the board.
+
+Step 2: Replace .apply() with vectorized operations
+Instead of three separate row-wise calls, one vectorized expression does the same work:
+
+# Before: three .apply() calls, three passes through 1 million rows
+df['gross_revenue'] = df.apply(lambda row: row['sales'] * row['quantity'], axis=1)
+df['tax'] = df.apply(lambda row: row['gross_revenue'] * 0.075, axis=1)
+df['net_revenue'] = df.apply(lambda row: row['gross_revenue'] - row['tax'], axis=1)
+
+# After: one vectorized expression, no temporary columns
+df['net_revenue'] = df['sales'] * df['quantity'] * (1 - 0.075)
+
+Step 3: Replace row-wise flagging with np.where()
+
+# Before
+df['order_flag'] = df.apply(
+    lambda row: 'high' if row['net_revenue'] > 50000 else 'low', axis=1
+)
+
+# After
+df['order_flag'] = np.where(df['net_revenue'] > 50000, 'high', 'low')
+
+Same logic. Vectorized. Done.
+The Fast Version
+
+Put it all together and the pipeline looks like this:
+
+import time
+
+df = pd.read_csv('large_sales_data.csv')
+
+start = time.time()
+
+# Fix 1: Correct data types upfront
+df['region'] = df['region'].astype('category')
+df['category'] = df['category'].astype('category')
+df['status'] = df['status'].astype('category')
+
+# Fix 2: Vectorized revenue calculation, no temporary columns
+df['net_revenue'] = df['sales'] * df['quantity'] * (1 - 0.075)
+
+# Fix 3: Vectorized flagging with np.where
+df['order_flag'] = np.where(df['net_revenue'] > 50000, 'high', 'low')
+
+# Final aggregation
+result = df.groupby('region')['net_revenue'].sum()
+
+end = time.time()
+print(f"Total runtime: {end - start:.2f} seconds")
+
+Output:
+
+Total runtime: 0.33 seconds
+
+61.78 seconds down to 0.33 seconds. A 99.5% reduction in runtime. That’s like 187x faster.
+
+It’s not a trick. That’s just how Pandas is supposed to be used.
+Before You Run Your Next Notebook
+
+Everything we covered comes down to a few core habits. Not rules. Not tricks. Just a different way of thinking about your code before you write it.
+
+    Think in columns, not rows. If you’re looping through a dataframe row by row, stop and ask whether the same thing can be expressed as a column operation. Nine times out of ten, it can.
+    Measure before you optimize. Don’t guess where the slowness is coming from. Use %timeit and df.memory_usage() to let the numbers tell you what to fix.
+    Watch your memory, not just your speed. Wrong data types, unnecessary copies and temporary columns all add up. A lighter dataframe is a faster dataframe.
+    Know when to switch tools. Pandas is the right choice most of the time. But at a certain scale, the right optimization is recognizing that you’ve outgrown it.
+
+I started this rabbit hole because I kept seeing the same conversation come up in data communities. People frustrated with slow notebooks, code that worked fine on small data and fell apart on real data. I wanted to understand why.
+
+What I found was that the code wasn’t broken. It just wasn’t built to scale. And the gap between code that works and code that works efficiently isn’t about being an advanced Pandas user. It’s about a handful of habits applied consistently.
+
+If you’ve ever waited too long for a notebook to finish and just assumed that was normal, now you know it doesn’t have to be.
+
+If this changed how you think about your Pandas code, I’d love to hear what bottlenecks you’ve been dealing with. Feel free to say hi on any of these platforms
+
